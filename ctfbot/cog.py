@@ -384,6 +384,7 @@ class CtfCog(commands.Cog):
     @commands.slash_command()
     async def solve(self, ctx: discord.ApplicationContext,
                     i_have_submitted_the_flag: discord.Option(bool)):
+
         data = self.data.servers[ctx.guild_id]
         guild: discord.Guild = ctx.guild
         thread = ctx.channel
