@@ -62,16 +62,3 @@ class ServerData:
 class GlobalData:
     servers: DefaultDict[int, ServerData] = field(
         default_factory=lambda: defaultdict(ServerData))
-
-# initialize sqlite database file
-
-
-def init_db():
-    conn = sqlite3.connect('ctfbot.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS servers
-                 (id INTEGER PRIMARY KEY, data TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS global
-                 (id INTEGER PRIMARY KEY, data TEXT)''')
-    conn.commit()
-    conn.close()
