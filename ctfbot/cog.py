@@ -1,22 +1,23 @@
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
 import jsonpickle
-
+import math
 from decouple import config
 from discord.ext import commands
 
 from ctfbot import ctftime
-from ctfbot.data import GlobalData
+from ctfbot.data import Chall_board_indicies, Category_and_challenge, Challenges, Event, GlobalData
+
+from ctfbot.helpers import get_event_ctx, get_event_from_channel, update_indicies, move_board, get_embed_from_index, gen_csv_of_solves
 
 JSON_DATA_FILE = Path.cwd() / 'data.json'
-
+MAX_FIELDS = 25
 
 def iso_to_pretty(iso):
     return datetime.fromisoformat(iso).strftime("%B %d at %I%p")
-
 
 class CtfCog(commands.Cog):
     data: GlobalData = None
@@ -43,18 +44,51 @@ class CtfCog(commands.Cog):
         await ctx.respond("An internal error occurred")
 
     def write_data(self):
-        JSON_DATA_FILE.write_text(jsonpickle.encode(self.data, indent=4))
+        if not JSON_DATA_FILE.exists(): JSON_DATA_FILE.touch()
+        JSON_DATA_FILE.write_text(jsonpickle.encode(self.data, indent=4, keys=True))
 
     def load_data(self):
         try:
-            self.data = jsonpickle.decode(JSON_DATA_FILE.read_text())
-            # for server in self.data.servers.values():
-            #     for reminder in server.reminders.values():
-            #         self.scheduler.enter(reminder.utcnow(), 1, lambda: self.)
+            self.data = jsonpickle.decode(JSON_DATA_FILE.read_text(), keys=True)
+
         except OSError:
-            print("Couldn't read default data file")
             self.data = GlobalData()
             self.write_data()
+
+    # @commands.slash_command()
+    # @commands.has_permissions(administrator=True)
+    # async def delete_channels(self, ctx: discord.ApplicationContext):
+    #     keep_channel_id = 1112433431767437384
+    #     guild: discord.Guild = ctx.guild
+    #     keep_channel = guild.get_channel(keep_channel_id)
+        
+    #     if keep_channel is None:
+    #         await ctx.respond(f"Channel with ID {keep_channel_id} not found.")
+    #         return
+
+    #     # Delete all channels except the one with keep_channel_id
+    #     for channel in guild.channels:
+    #         if channel.id != keep_channel_id:
+    #             try:
+    #                 await channel.delete()
+    #             except Exception as e:
+    #                 await ctx.respond(f"Failed to delete channel: {channel.name}. Error: {e}")
+
+    #     # Delete all categories except the one with keep_category_id
+    #     for category in guild.categories:
+    #         try:
+    #             await category.delete()
+    #         except Exception as e:
+    #             await ctx.respond(f"Failed to delete category: {category.name}. Error: {e}")
+    #             # Delete channels within the keep_category
+    #         for channel in category.channels:
+    #             if channel.id != keep_channel_id:
+    #                 try:
+    #                     await channel.delete()
+    #                 except Exception as e:
+    #                     await ctx.respond(f"Failed to delete channel in kept category: {channel.name}. Error: {e}")
+
+    #     await ctx.respond("Finished deleting channels and categories.")
 
     @commands.slash_command()
     async def upcoming(self, ctx: discord.ApplicationContext):
@@ -85,19 +119,22 @@ class CtfCog(commands.Cog):
     @commands.slash_command()
     @commands.has_permissions(administrator=True)
     async def register(self, ctx: discord.ApplicationContext,
-                       event_id: discord.Option(int), category_name: discord.Option(str)):
+                       event_id: discord.Option(int), category_name: discord.Option(str),
+                       ctf_verified_required: discord.Option(bool)):
         data = self.data.servers[ctx.guild_id]
         if str(event_id) in data.events or str(event_id) in data.archived_events:
             await ctx.respond('You have already registered/played this event!')
             return
         event = ctftime.get_event(event_id)
+        
         if event is None:
             await ctx.respond('Event not found')
             return
+        
         guild: discord.Guild = ctx.guild
-        category: discord.CategoryChannel = await guild.create_category(name=category_name,
+        category: discord.CategoryChannel = await guild.create_category(name=category_name + "🚩",
                                                                         position=config('CTF_CATEGORY_POS'))
-        data.events[event_id] = category.id
+        data.event_categories[category.id] = event_id
         overwrites = {guild.default_role: discord.PermissionOverwrite(send_messages=False,
                                                                       add_reactions=False, manage_threads=False)}
         channel_join: discord.TextChannel = await guild.create_text_channel(name='join-ctf',
@@ -112,41 +149,108 @@ class CtfCog(commands.Cog):
         channel_general: discord.TextChannel = await guild.create_text_channel(name='general',
                                                                                category=category,
                                                                                overwrites=overwrites)
-        message_challenges_embed = discord.Embed(
+        message_chall_board_embed = discord.Embed(
             title=f"{category_name} Challenges",
             description="Current and solved challenges. To add a challenge, use the command /challenge in" +
             f"{channel_general.mention}. To solve a challenge, use the command /solve in a challenge thread." +
-            "If you created a challenge by mistake, contact an admin to use /remove",
+            " If you created a challenge by mistake, contact an admin to use /remove",
             color=discord.Colour.yellow(),
         )
-        message_challenges: discord.Message = await channel_challenges.send(embed=message_challenges_embed)
+        message_chall_board: discord.Message = await channel_challenges.send(embed=message_chall_board_embed)
         message_info: discord.Message = await channel_join.send(embed=self.create_event_embed(event))
         message_join_embed = discord.Embed(
             title=f"Join {category_name}",
-            description="To join the CTF, react with the :white_check_mark: emoji below!" +
-            " You must have the CTF-Verified role to join. Please message an admin/officer to obtain this role.",
+            description="To join the CTF, react with the :white_check_mark: emoji below!",
             color=discord.Colour.green(),
         )
+
         message_join: discord.Message = await channel_join.send(embed=message_join_embed)
         await message_join.add_reaction("✅")
+        if ctf_verified_required:
+            message_verified_embed = discord.Embed(
+                title=f"This is a CTF-Verified ✅ event",
+                description="You must have the CTF-Verified role to join. "
+                + "Please message an admin/officer to obtain this role.",
+                color=discord.Colour.green(),
+            )
+            message_verified: discord.Message = await channel_join.send(embed=message_verified_embed)
+        
+        challenges_instance = Challenges()
+
+        data.events[event_id] = Event(
+            ctf_verified=ctf_verified_required,
+            category_id=category.id,
+            channel_join=channel_join.id,
+            channel_logs=channel_join_logs.id,
+            channel_challenges=channel_challenges.id,
+            channel_general=channel_general.id,
+            join_message=message_join.id,
+            challenges=challenges_instance
+        )
         await ctx.respond(f"Event Created! Join at {channel_join.mention}")
         self.write_data()
 
     @commands.slash_command()
     @commands.has_permissions(administrator=True)
-    async def archive(self, ctx: discord.ApplicationContext):
-        guild: discord.Guild = ctx.guild
-        category: discord.CategoryChannel = guild.get_channel(config('ARCHIVE_CATEGORY_ID', cast=int))
+    async def connect_to_ctfd(self, ctx: discord.ApplicationContext,
+                       username: discord.Option(str)):
         data = self.data.servers[ctx.guild_id]
-        for event_id, channel_id in data.events.items():
-            if int(channel_id) == ctx.channel_id:
-                await ctx.channel.edit(category=category)
-                del data.events[event_id]
-                data.archived_events.append(event_id)
-                self.write_data()
-                await ctx.respond('Done!')
-                return
-        await ctx.respond('Current channel is not an active CTF')
+        data.user_to_ctfd[ctx.author.id] = username
+        user = await self.bot.fetch_user(ctx.author.id)
+        await ctx.respond(ctx.author.mention + 'has connected to the [CTFd](https://ctfd.wolvsec.org/) with username: ' + username + ' to get CTF solve points! (/connect_to_ctfd)')
+        self.write_data()
+        
+        
+    @commands.slash_command()
+    @commands.has_permissions(administrator=True)
+    async def end_ctf(self, ctx: discord.ApplicationContext):
+        data = self.data.servers[ctx.guild_id]
+        guild: discord.Guild = ctx.guild
+        if (event := get_event_ctx(data, ctx)) is None:
+            await ctx.respond('Current channel is not an active CTF')
+            return
+        join_channel = guild.get_channel(event.channel_join)
+        logs_channel = guild.get_channel(event.channel_logs)
+        challenge_channel = guild.get_channel(event.channel_challenges)
+        general_channel = guild.get_channel(event.channel_general)
+        message_end = discord.Embed(
+            title=f"This CTF has been ended! 🛑",
+            description=f"Thank you for playing! This channel is now publicly viewable.",
+            color=discord.Colour.red(),
+        )
+        await general_channel.send(embed=message_end)
+        for message_id in event.challenges.chall_board_msg_ids:
+            message_chall_board: discord.Message = await challenge_channel.fetch_message(message_id)
+            await general_channel.send(embed=message_chall_board.embeds[0])
+        filename = "solves.csv"
+        gen_csv_of_solves(event, data, filename)
+        with open(filename, 'rb') as file:
+            await general_channel.send("Here is the CSV file of solves for each user:", file=discord.File(file, filename))
+        category_id = event.category_id
+        category = guild.get_channel(category_id)
+        await general_channel.edit(name=category.name)
+        
+        delete_string = "TO BE DELETED ❌"
+        await category.edit(name=delete_string)
+        await join_channel.edit(name=delete_string)
+        await logs_channel.edit(name=delete_string)
+        await challenge_channel.edit(name=delete_string)
+
+        archive_category_id = config('ARCHIVE_CATEGORY_ID', cast=int)
+        archive_category = guild.get_channel(archive_category_id)
+
+        try:
+            await general_channel.edit(category=archive_category)
+        except Exception as e:
+            await general_channel.send("ERROR: Unable to move to archive category")
+        
+        event_id = data.event_categories[category_id]
+        data.archived_events.append(event_id)
+        del data.events[event_id]
+        del data.event_categories[category_id]
+        await ctx.respond('Event has been sucessfully ended!')
+        self.write_data()
+
 
     @commands.slash_command()
     async def team(self, ctx: discord.ApplicationContext, team_id: discord.Option(int)):
@@ -175,10 +279,11 @@ class CtfCog(commands.Cog):
         data = self.data.servers[ctx.guild_id]
         if ctx.channel_id in data.reminders:
             await ctx.respond('Removed reminder for this event')
-            data.reminders[ctx.channel_id] = datetime.utcnow()
+            data.reminders[ctx.channel_id] = datetime.now(timezone.utc)
         else:
             await ctx.respond('Added reminder for this event')
             del data.reminders[ctx.channel_id]
+        self.write_data()
 
     @commands.slash_command()
     async def challenge(self, ctx: discord.ApplicationContext, chal_category: discord.Option(str),
@@ -187,164 +292,138 @@ class CtfCog(commands.Cog):
         if any(banned_string in chal_category or banned_string in chal_name for banned_string in banned_strings):
             await ctx.respond('Invalid character in challenge name/category')
             return
-        guild: discord.Guild = ctx.guild
-        data = self.data.servers[ctx.guild_id]
-        for event_id, category_id in data.events.items():
-            category = guild.get_channel(category_id)
-            if category and ctx.channel_id == category.channels[3].id:
-                break
-        else:
-            await ctx.respond('This is not a CTF channel')
+        # if chall name or chal category are longer than 50 characters return
+        if len(chal_name) > 50 or len(chal_category) > 50:
+            await ctx.respond('Challenge name or can not be longer than 50 characters')
             return
-        channel_challenges: discord.TextChannel = category.channels[2]
-        channel_general: discord.TextChannel = category.channels[3]
-        message_challs: discord.Message = await channel_challenges.fetch_message(channel_challenges.last_message_id)
-        embed = message_challs.embeds[0]
-        thread = None
-        for index, field in enumerate(embed.fields):
-            if field.name == f'**{chal_category}**':
-                for i in range(index + 1, len(embed.fields)):
-                    if embed.fields[i].value.startswith(chal_name):
-                        await ctx.respond('Challenge already exists')
-                        return
-                    elif embed.fields[i].name.startswith('**'):
-                        break
-                else:
-                    i = len(embed.fields)
-                break
-        else:
-            embed.add_field(name=f'**{chal_category}**', value='')
-            i = len(embed.fields)
+        data = self.data.servers[ctx.guild_id]
+        guild: discord.Guild = ctx.guild
+        if (event := get_event_ctx(data, ctx)) is None:
+            await ctx.respond('Current channel is not an active CTF')
+            return
+        challenges = event.challenges
+        challenge_channel = guild.get_channel(event.channel_challenges)
+        if (chal_category, chal_name) in challenges.category_challenge_to_chall_board:
+            await ctx.respond('Challenge already exists')
+            return
 
-        thread = await channel_general.create_thread(name=chal_category + '/' + chal_name, type=discord.ChannelType.public_thread)
-        embed.insert_field_at(i, name='', value=chal_name + ' → ' + thread.mention, inline=False)
+        space_allocated = 2 if chal_category not in challenges.category_to_chall_board else 1
+        if (math.floor((challenges.chall_board_field_count -1 + space_allocated) / MAX_FIELDS) + 1 > len(challenges.chall_board_msg_ids)):
+            message_chall_board_embed = discord.Embed(description="Challenges", color=discord.Colour.yellow())
+            message_chall_board: discord.Message = await challenge_channel.send(
+                                                   embed=message_chall_board_embed)
+            challenges.chall_board_msg_ids.append(message_chall_board.id)
 
-        await message_challs.edit(embed=embed)
+        if chal_category not in challenges.category_to_chall_board:
+            last_pos = len(challenges.chall_board_msg_ids) - 1
+            challenges.category_to_chall_board[chal_category] = Chall_board_indicies(challenges.chall_board_field_count, challenges.chall_board_field_count + 1)
+            message_chall_board: discord.Message = await challenge_channel.fetch_message(
+                challenges.chall_board_msg_ids[last_pos])
+            embed = message_chall_board.embeds[0]
+            embed.add_field(name=f'__**{chal_category}**__', value='')
+            challenges.chall_board_field_count += 1
+            await message_chall_board.edit(embed=embed)
+            index_to_insert = challenges.chall_board_field_count
+        else: 
+            index_to_insert = challenges.category_to_chall_board[chal_category].last_challenge_index + 1
+            challenges.category_to_chall_board[chal_category].last_challenge_index += 1
+            await update_indicies(event, index_to_insert + 1)
+            board_shift_needed = (math.floor(index_to_insert / MAX_FIELDS) + 1) != len(challenges.chall_board_msg_ids)
+            if (board_shift_needed):
+                await move_board(event, index_to_insert, challenge_channel)
+        
+        message_chall_board: discord.Message = await challenge_channel.fetch_message(
+        challenges.chall_board_msg_ids[math.floor(index_to_insert / MAX_FIELDS)])
+        embed = message_chall_board.embeds[0]
+        challenges.category_challenge_to_chall_board[(chal_category, chal_name)] = index_to_insert
+        thread = await guild.get_channel(event.channel_general).create_thread(
+                 name=chal_category + '/' + chal_name, type=discord.ChannelType.public_thread)
+        embed.insert_field_at(index_to_insert % MAX_FIELDS, name='', value=chal_name + ' → ' + thread.mention, inline=False)
+        challenges.chall_board_field_count += 1
+        challenges.thread_id_to_challenge[thread.id] = Category_and_challenge(chal_category, chal_name)
+        await message_chall_board.edit(embed=embed)
         await ctx.respond(f'Challenge created {thread.mention}')
+        self.write_data()
 
     @commands.slash_command()
-    @commands.has_permissions(administrator=True)
-    async def remove(self, ctx: discord.ApplicationContext, chal_category: discord.Option(str),
-                     chal_name: discord.Option(str)):
-        guild: discord.Guild = ctx.guild
+    async def hide(self, ctx: discord.ApplicationContext):
         data = self.data.servers[ctx.guild_id]
-        for event_id, category_id in data.events.items():
-            category = guild.get_channel(category_id)
-            if category and ctx.channel_id == category.channels[3].id:
-                break
-        else:
-            await ctx.respond('This is not a CTF channel')
+        guild: discord.Guild = ctx.guild
+        thread = ctx.channel
+        if (event := get_event_ctx(data, ctx)) is None:
+            await ctx.respond('Current channel is not an active CTF')
             return
-        channel_challenges: discord.TextChannel = category.channels[2]
-        message_challs: discord.Message = await channel_challenges.fetch_message(channel_challenges.last_message_id)
-        embed = message_challenges.embeds[0]
-        for index, field in enumerate(embed.fields):
-            if field.name == f'**{chal_category}**':
-                for i in range(index + 1, len(embed.fields)):
-                    if embed.fields[i].value.startswith(chal_name):
-                        thread_id = int(embed.fields[i].value.split(' → <#')[1].split('>')[0])
-                        thread: discord.Thread = guild.get_thread(thread_id)
-                        await thread.edit(archived=True)
-                        embed.remove_field(i)
-                        if embed.fields[i - 1].name.startswith('**') and (i == len(embed.fields) or
-                           embed.fields[i].name.startswith('**')):
-                            embed.remove_field(i - 1)
-                        await message_challs.edit(embed=embed)
-                        await ctx.respond('Challenge removed')
-                        return
-        await ctx.respond('Challenge not found')
-
-    @commands.slash_command()
-    async def solve(self, ctx: discord.ApplicationContext, flag: discord.Option(str),
-                    display_flag: discord.Option(bool)):
-        guild: discord.Guild = ctx.guild
-        data = self.data.servers[ctx.guild_id]
-        found_thread = False
-        for event_id, category_id in data.events.items():
-            category = guild.get_channel(category_id)
-            channel_challs: discord.TextChannel = category.channels[2]
-            message_challs: discord.Message = await channel_challs.fetch_message(channel_challs.last_message_id)
-            embed = message_challs.embeds[0]
-            for index, field in enumerate(embed.fields):
-                if not field.name.startswith('**'):
-                    thread_id = int(field.value.split(' → <#')[1].split('>')[0])
-                    if (ctx.channel_id == thread_id):
-                        embed_field = embed.fields[index]
-                        found_thread = True
-                        break
-            if found_thread:
-                break
-        else:
+        challenges = event.challenges
+        challenge_channel = guild.get_channel(event.channel_challenges)
+        if thread.id not in challenges.thread_id_to_challenge:
             await ctx.respond('This is not a CTF thread')
             return
-        if (embed_field.value.startswith('~~')):
-            await ctx.respond('Challenge already solved')
+        if thread.id in challenges.solved_challs:
+            await ctx.respond('Challenge solved, can not hide')
             return
-        challenge_name = embed_field.value.split(' → ')[0]
-        if not display_flag:
-            flag = "HIDDEN"
-        message_challenges_embed = discord.Embed(
-            title=f"{challenge_name} has been solved!",
-            description=f"{ctx.author.mention} has solved with flag: {flag}",
-            color=discord.Colour.green(),
-        )
-        message_solve: discord.Message = await category.channels[3].send(embed=message_challenges_embed)
-        embed.set_field_at(index, name='', value="~~" + embed_field.value + '~~ has been solved by ' +
-                           ctx.author.mention + '!', inline=False)
-        await message_challs.edit(embed=embed)
-        await ctx.respond('Flag submitted!')
-
-    @commands.slash_command()
-    async def solve_backup(self, ctx: discord.ApplicationContext, flag: discord.Option(str),
-                    display_flag: discord.Option(bool), general_channel_id: discord.Option(str), challenge_name:  discord.Option(str)):
-        guild: discord.Guild = ctx.guild
-        data = self.data.servers[ctx.guild_id]
-        for event_id, category_id in data.events.items():
-            category = guild.get_channel(category_id)
-            if category and general_channel_id == str(category.channels[3].id):
-                break
+        category_and_challenge = challenges.thread_id_to_challenge[ctx.channel_id]
+        category = category_and_challenge.category
+        challenge = category_and_challenge.challenge
+        index = challenges.category_challenge_to_chall_board[(category, challenge)]
+        embed, message_chall_board = await get_embed_from_index(index, challenges, challenge_channel)
+        if thread.id in challenges.hidden_challs:
+            challenges.hidden_challs.remove(thread.id)
+            embed.set_field_at(index % MAX_FIELDS, name='', value=challenge + ' → ' + thread.mention, inline=False)
+            await thread.edit(archived=False)
+            await message_chall_board.edit(embed=embed)
+            await ctx.respond(f'Challenge un-hidden. To hide, use /hide again')
         else:
-            await ctx.respond('This is not a CTF channel')
+            challenges.hidden_challs.add(thread.id)
+            embed.set_field_at(index % MAX_FIELDS, name='', value="~~" + challenge + ' → ' + thread.mention + '~~ is hidden', inline=False)
+            await message_chall_board.edit(embed=embed)
+            await ctx.respond('Challenge hidden. To unhide, use /hide again')
+            await thread.edit(archived=True)
+        self.write_data()
+
+    @commands.slash_command()
+    async def solve(self, ctx: discord.ApplicationContext, i_have_submitted_the_flag: discord.Option(bool)):
+        data = self.data.servers[ctx.guild_id]
+        guild: discord.Guild = ctx.guild
+        thread = ctx.channel
+        if (event := get_event_ctx(data, ctx)) is None:
+            await ctx.respond('Current channel is not an active CTF')
             return
-        channel_general: await guild.get_channel(general_channel_id)
+        challenges = event.challenges
+        challenge_channel = guild.get_channel(event.channel_challenges)
+        general_channel = guild.get_channel(event.channel_general)
+        if thread.id not in challenges.thread_id_to_challenge:
+            await ctx.respond('This is not a CTF thread')
+            return
+        if thread.id in challenges.solved_challs:
+            await ctx.respond('Challenge solved already')
+            return
+        if thread.id in challenges.hidden_challs:
+            await ctx.respond('Challenge hidden, can not solve')
+            return
+        if not i_have_submitted_the_flag:
+            await ctx.respond('You need to submit the flag first!')
+            return
+        category_and_challenge = challenges.thread_id_to_challenge[ctx.channel_id]
+        category = category_and_challenge.category
+        challenge = category_and_challenge.challenge
+        index = challenges.category_challenge_to_chall_board[(category, challenge)]
+        embed, message_chall_board = await get_embed_from_index(index, challenges, challenge_channel)
+
+        challenges.solved_challs.add(thread.id)
+        embed.set_field_at(index % MAX_FIELDS, name='', value="~~" + challenge + ' → ' + 
+                           thread.mention + '~~ has been solved by ' +
+                           ctx.author.mention + '!', inline=False)
+        await message_chall_board.edit(embed=embed)
+        challenges.solves_per_user[ctx.author.id] += 1
         message_challenges_embed = discord.Embed(
-            title=f"{challenge_name} has been solved!",
-            description=f"{ctx.author.mention} has solved with flag: {flag}",
+            title=f"{category}/{challenge} has been solved! 🎉",
+            description=f"{ctx.author.mention} has solved the challenge! Total solves this CTF: **{challenges.solves_per_user[ctx.author.id]}**",
             color=discord.Colour.green(),
         )
-        message_solve: discord.Message = await category.channels[3].send(embed=message_challenges_embed)
-        await ctx.respond('Flag submitted!')
-
-    @commands.slash_command()
-    @commands.has_permissions(administrator=True)
-    async def print_events(self, ctx: discord.ApplicationContext):
-        data = self.data.servers[ctx.guild_id]
-        if data.events == {}:
-            await ctx.respond('No events')
-            return
-        for event_id, category_id in data.events.items():
-            await ctx.respond(f'{event_id}: {category_id}')
-
-    @commands.slash_command()
-    @commands.has_permissions(administrator=True)
-    async def set_event_category_id(self, ctx: discord.ApplicationContext, event_id: discord.Option(int),
-                                    category_id: discord.Option(str)):
-        data = self.data.servers[ctx.guild_id]
-        if event_id in data.events:
-            await ctx.respond('Event id already exists')
-            return
-        data.events[event_id] = int(category_id)
-        await ctx.respond(f'Added event {event_id} with category {category_id}')
-
-    @commands.slash_command()
-    @commands.has_permissions(administrator=True)
-    async def remove_event(self, ctx: discord.ApplicationContext, event_id: discord.Option(int)):
-        data = self.data.servers[ctx.guild_id]
-        if event_id not in data.events:
-            await ctx.respond('Event id does not exist')
-            return
-        data.events.pop(event_id)
-        await ctx.respond(f'Removed event {event_id}')
+        message_solve: discord.Message = await general_channel.send(embed=message_challenges_embed)
+        await ctx.respond('Challenge has been solved! 🎉')
+        await thread.edit(archived=True)
+        self.write_data()
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
@@ -352,36 +431,41 @@ class CtfCog(commands.Cog):
             return
         guild = self.bot.get_guild(payload.guild_id)
         data = self.data.servers[guild.id]
-        for event_id, category_id in data.events.items():
-            category = guild.get_channel(category_id)
-            if category and payload.channel_id == category.channels[0].id:
-                break
-        else:
+        channel = guild.get_channel(payload.channel_id)
+        if (event := get_event_from_channel(data, channel)) is None:
+            return
+        if (event.join_message != payload.message_id):
             return
         player = await guild.fetch_member(payload.user_id)
-        if discord.utils.get(guild.roles, id=config('CTF_VERIFIED_ROLE_ID', cast=int)) not in player.roles:
-            player = await bot.fetch_user(payload.user_id)
+        if event.ctf_verified and discord.utils.get(guild.roles, id=config('CTF_VERIFIED_ROLE_ID', cast=int)) not in player.roles:
+            player = await self.bot.fetch_user(payload.user_id)
             await player.send('You do not have the CTF-Verified role! Please contact an admin to get this role.')
             return
-        await category.channels[1].set_permissions(player, read_messages=True, send_messages=False,
+        await guild.get_channel(event.channel_logs).set_permissions(player, read_messages=True, send_messages=False,
                                                    add_reactions=False, manage_threads=False)
-        await category.channels[2].set_permissions(player, read_messages=True, send_messages=False,
+        await guild.get_channel(event.channel_challenges).set_permissions(player, read_messages=True, send_messages=False,
                                                    add_reactions=False, manage_threads=False)
-        await category.channels[3].set_permissions(player, read_messages=True)
-        await category.channels[1].send(f'{player.mention} has joined the CTF!')
+        await guild.get_channel(event.channel_general).set_permissions(player, read_messages=True)
+        if payload.user_id not in event.challenges.solves_per_user:
+            event.challenges.solves_per_user[payload.user_id] = 0
+        await guild.get_channel(event.channel_logs).send(f'{player.mention} has joined the CTF!')
+        self.write_data()
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload):
         guild = self.bot.get_guild(payload.guild_id)
         data = self.data.servers[guild.id]
-        for event_id, category_id in data.events.items():
-            category = guild.get_channel(category_id)
-            if category and payload.channel_id == category.channels[0].id:
-                break
-        else:
+        channel = guild.get_channel(payload.channel_id)
+        if (event := get_event_from_channel(data, channel)) is None:
+            return
+        if (event.join_message != payload.message_id):
             return
         player = await guild.fetch_member(payload.user_id)
-        await category.channels[1].set_permissions(player, read_messages=False)
-        await category.channels[2].set_permissions(player, read_messages=False)
-        await category.channels[3].set_permissions(player, read_messages=False)
-        await category.channels[1].send(f'{player.mention} has left the CTF!')
+        await guild.get_channel(event.channel_logs).set_permissions(player, read_messages=False)
+        await guild.get_channel(event.channel_join).set_permissions(player, read_messages=False)
+        await guild.get_channel(event.channel_general).set_permissions(player, read_messages=False)
+        if event.challenges.solves_per_user[payload.user_id] == 0:
+            del event.challenges.solves_per_user[payload.user_id]
+        await guild.get_channel(event.channel_logs).send(f'{player.mention} has left the CTF!')
+        self.write_data()
+
