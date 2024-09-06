@@ -3,17 +3,20 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import DefaultDict, List, Set
 import sqlite3
-from enum import Enum
+
 
 @dataclass
 class Chall_board_indicies:
     category_name_index: int = -1
     last_challenge_index: int = -1
 
+
 @dataclass
 class Category_and_challenge:
     category: str = ""
     challenge: str = ""
+
+
 @dataclass
 class Challenges:
     chall_board_msg_ids: List[int] = field(default_factory=list)
@@ -24,16 +27,16 @@ class Challenges:
         default_factory=lambda: defaultdict(int))
     thread_id_to_challenge: DefaultDict[int, Category_and_challenge] = field(
         default_factory=lambda: defaultdict(Category_and_challenge))
-    
+
     hidden_challs: Set = field(default_factory=set)
     solved_challs: Set = field(default_factory=set)
-    solves_per_user: DefaultDict[int, int] = field(default_factory=lambda: defaultdict(int))
+    solves_per_user: DefaultDict[int, int] = field(
+        default_factory=lambda: defaultdict(int))
 
-    
+
 @dataclass
 class Event:
     ctf_verified: bool
-    category_id: int
     channel_join: int
     channel_logs: int
     channel_challenges: int
@@ -41,20 +44,27 @@ class Event:
     join_message: int
     challenges: Challenges
 
+
 @dataclass
 class ServerData:
-    events: DefaultDict[int, Event] = field(default_factory=lambda: defaultdict(Event))
-    event_categories: DefaultDict[int, int] = field(default_factory=lambda: defaultdict(int))
-    user_to_ctfd: DefaultDict[int, int] = field(default_factory=lambda: defaultdict(int))
+    events: DefaultDict[int, Event] = field(
+        default_factory=lambda: defaultdict(Event))
+    event_categories: DefaultDict[int, int] = field(
+        default_factory=lambda: defaultdict(int))
+    user_to_ctfd: DefaultDict[int, int] = field(
+        default_factory=lambda: defaultdict(int))
     archived_events: List[int] = field(default_factory=list)
-    reminders: DefaultDict[int, datetime] = field(default_factory=lambda: defaultdict(datetime))
+    # reminders: DefaultDict[int, datetime] = field(
+    #     default_factory=lambda: defaultdict(datetime))
 
 
 @dataclass
 class GlobalData:
-    servers: DefaultDict[int, ServerData] = field(default_factory=lambda: defaultdict(ServerData))
+    servers: DefaultDict[int, ServerData] = field(
+        default_factory=lambda: defaultdict(ServerData))
 
 # initialize sqlite database file
+
 
 def init_db():
     conn = sqlite3.connect('ctfbot.db')
